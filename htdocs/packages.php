@@ -33,9 +33,10 @@ if (!file_exists($config_file)) {
 }
 $confs = parse_ini_file($config_file);
 
-$client = new Client($confs['endpoint']);
+$client = Client::create($confs['endpoint']);
 $client->authenticate($confs['api_key'], Client::AUTH_URL_TOKEN);
 
+$groups = $client->api('groups');
 $projects = $client->api('projects');
 $repos = $client->api('repositories');
 
@@ -46,6 +47,8 @@ if (isset($confs['method']) && in_array($confs['method'], $validMethods)) {
     define('method', 'ssh');
 }
 
+$allow_package_name_mismatches = !empty($confs['allow_package_name_mismatch']);
+
 /**
  * Retrieves some information about a project's composer.json
  *
@@ -53,13 +56,17 @@ if (isset($confs['method']) && in_array($confs['method'], $validMethods)) {
  * @param string $ref commit id
  * @return array|false
  */
-$fetch_composer = function($project, $ref) use ($repos) {
+$fetch_composer = function($project, $ref) use ($repos, $allow_package_name_mismatches) {
     try {
-        $data = array();
-        $c = $repos->blob($project['id'], $ref, 'composer.json');
-        $composer = is_array($c) ? $c : json_decode($c, true);
+        $c = $repos->getFile($project['id'], 'composer.json', $ref);
 
-        if (empty($composer['name'])) {
+        if(!isset($c['content'])) {
+            return false;
+        }
+
+        $composer = json_decode(base64_decode($c['content']), true);
+
+        if (empty($composer['name']) || (!$allow_package_name_mismatches && strcasecmp($composer['name'], $project['path_with_namespace']) !== 0)) {
             return false; // packages must have a name and must match
         }
 
@@ -77,24 +84,33 @@ $fetch_composer = function($project, $ref) use ($repos) {
  * @return array   [$version => ['name' => $name, 'version' => $version, 'source' => [...]]]
  */
 $fetch_ref = function($project, $ref) use ($fetch_composer) {
-    if (preg_match('/^v?\d+\.\d+(\.\d+)*(\-(dev|patch|alpha|beta|RC)\d*)?$/', $ref['name'])) {
-        $version = $ref['name'];
-    } else {
-        $version = 'dev-' . $ref['name'];
+
+    static $ref_cache = [];
+
+    $ref_key = md5(serialize($project) . serialize($ref));
+
+    if (!isset($ref_cache[$ref_key])) {
+        if (preg_match('/^v?\d+\.\d+(\.\d+)*(\-(dev|patch|alpha|beta|RC)\d*)?$/', $ref['name'])) {
+            $version = $ref['name'];
+        } else {
+            $version = 'dev-' . $ref['name'];
+        }
+
+        if (($data = $fetch_composer($project, $ref['commit']['id'])) !== false) {
+            $data['version'] = $version;
+            $data['source'] = [
+                'url'       => $project[method . '_url_to_repo'],
+                'type'      => 'git',
+                'reference' => $ref['commit']['id'],
+            ];
+
+            $ref_cache[$ref_key] = [$version => $data];
+        } else {
+            $ref_cache[$ref_key] = [];
+        }
     }
 
-    if (($data = $fetch_composer($project, $ref['commit']['id'])) !== false) {
-        $data['version'] = $version;
-        $data['source'] = array(
-            'url'       => $project[method . '_url_to_repo'],
-            'type'      => 'git',
-            'reference' => $ref['commit']['id'],
-        );
-
-        return array($version => $data);
-    } else {
-        return array();
-    }
+    return $ref_cache[$ref_key];
 };
 
 /**
@@ -104,7 +120,6 @@ $fetch_ref = function($project, $ref) use ($fetch_composer) {
  */
 $fetch_refs = function($project) use ($fetch_ref, $repos) {
     $datas = array();
-
     try {
         foreach (array_merge($repos->branches($project['id']), $repos->tags($project['id'])) as $ref) {
             foreach ($fetch_ref($project, $ref) as $version => $data) {
@@ -153,28 +168,54 @@ $load_data = function($project) use ($fetch_refs) {
     }
 };
 
+/**
+ * Determine the name to use for the package.
+ *
+ * @param array $project
+ * @return string The name of the project
+ */
+$get_package_name = function($project) use ($allow_package_name_mismatches, $fetch_ref, $repos) {
+    if ($allow_package_name_mismatches) {
+        $ref = $fetch_ref($project, $repos->branch($project['id'], $project['default_branch']));
+        return reset($ref)['name'];
+    }
+
+    return $project['path_with_namespace'];
+};
+
+// Load projects
 $all_projects = array();
 $mtime = 0;
-
-$me = $client->api('users')->me();
-if ((bool)$me['is_admin']) {
-	$projects_api_method = 'all';
+if (!empty($confs['groups'])) {
+    // We have to get projects from specifics groups
+    foreach ($groups->all(array('page' => 1, 'per_page' => 100)) as $group) {
+        if (!in_array($group['name'], $confs['groups'], true)) {
+            continue;
+        }
+        for ($page = 1; count($p = $groups->projects($group['id'], array('page' => $page, 'per_page' => 100))); $page++) {
+            foreach ($p as $project) {
+                $all_projects[] = $project;
+                $mtime = max($mtime, strtotime($project['last_activity_at']));
+            }
+        }
+    }
 } else {
-	$projects_api_method = 'accessible';
-}
-
-for ($page = 1; count($p = $projects->$projects_api_method($page, 100)); $page++) {
-    foreach ($p as $project) {
-        $all_projects[] = $project;
-        $mtime = max($mtime, strtotime($project['last_activity_at']));
+    // We have to get all accessible projects
+    $me = $client->api('users')->me();
+    for ($page = 1; count($p = $projects->all(array('page' => $page, 'per_page' => 100))); $page++) {
+        foreach ($p as $project) {
+            $all_projects[] = $project;
+            $mtime = max($mtime, strtotime($project['last_activity_at']));
+        }
     }
 }
 
+// Regenerate packages_file is needed
 if (!file_exists($packages_file) || filemtime($packages_file) < $mtime) {
     $packages = array();
     foreach ($all_projects as $project) {
-        if ($package = $load_data($project)) {
-            $packages[$project['path_with_namespace']] = $package;
+        if (($package = $load_data($project)) && ($package_name = $get_package_name($project))) {
+            $packages[$package_name] = $package;
         }
     }
     if ( file_exists( $static_file ) ) {
